@@ -154,6 +154,69 @@ impl JarCdn {
         Ok(data)
     }
 
+    // Predownload and cache a file on startup
+    async fn predownload(&self, path: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        println!("🔄 Predownloading {}...", path);
+
+        // Check if we need to download
+        let (needs_update, current_version) = self.needs_update(path).await?;
+
+        if !needs_update {
+            let cache = self.cache.read().await;
+            if let Some(entry) = cache.get(path) {
+                println!("✅ {} already cached with version {:?} ({} bytes)",
+                         path, entry.version, entry.size);
+                return Ok(());
+            }
+        }
+
+        // Download the file
+        let data = self.fetch_upstream(path).await?;
+        let etag = Self::generate_etag(&data);
+        let now = Instant::now();
+
+        let entry = CacheEntry {
+            data: data.clone(),
+            etag,
+            last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+            expires: now + self.ttl,
+            content_type: if path.ends_with(".jar") {
+                "application/java-archive".to_string()
+            } else {
+                "application/octet-stream".to_string()
+            },
+            size: data.len(),
+            version: current_version,
+        };
+
+        // Store in cache
+        {
+            let mut cache = self.cache.write().await;
+
+            // Simple eviction: remove oldest entries if cache is full
+            if cache.len() >= self.max_cache_size {
+                // Find and remove the entry that expires first
+                if let Some(oldest_key) = cache.iter()
+                    .min_by_key(|(_, v)| v.expires)
+                    .map(|(k, _)| k.clone()) {
+                    cache.remove(&oldest_key);
+                    println!("Evicted cache entry: {}", oldest_key);
+                }
+            }
+
+            cache.insert(path.to_string(), entry.clone());
+        }
+
+        let version_info = if let Some(v) = current_version {
+            format!(" (version {})", v)
+        } else {
+            String::new()
+        };
+
+        println!("✅ Predownloaded and cached {} ({} bytes{})", path, entry.size, version_info);
+        Ok(())
+    }
+
     // Get from cache or fetch from upstream with version checking
     async fn get(&self, path: &str) -> Result<CacheEntry, Box<dyn std::error::Error + Send + Sync>> {
         // Check if we need to update based on version or cache validity
@@ -568,6 +631,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("⚠️  Could not fetch initial version: {}", e),
     }
 
+    // Predownload TropicsSpigot JAR
+    println!("📥 Predownloading TropicsSpigot JAR...");
+    match cdn.predownload("/tropicspigot.jar").await {
+        Ok(()) => println!("✅ TropicsSpigot JAR predownloaded and cached successfully!"),
+        Err(e) => {
+            println!("❌ Failed to predownload TropicsSpigot JAR: {}", e);
+            println!("⚠️  Server will still work, file will be downloaded on first request");
+        }
+    }
+
     // Bind to address
     let listener = TcpListener::bind(bind_addr).await?;
     println!("✅ Server ready! Endpoints:");
@@ -579,6 +652,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   POST http://localhost:8080/clear-cache                          (Clear cache)");
     println!();
     println!("💡 Smart Caching:");
+    println!("   - Predownloads TropicsSpigot JAR on startup");
     println!("   - Checks version before each download");
     println!("   - Only downloads when new version available");
     println!("   - Serves cached version at lightning speed");
@@ -597,19 +671,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 }
-
-// Add to Cargo.toml:
-/*
-[package]
-name = "jar-cdn-cache"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-tokio = { version = "1.0", features = ["full"] }
-bytes = "1.0"
-sha2 = "0.10"
-hex = "0.4"
-reqwest = { version = "0.11", features = ["stream"] }
-chrono = { version = "0.4", features = ["serde"] }
-*/
