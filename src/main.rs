@@ -600,7 +600,7 @@ async fn handle_connection(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configuration optimized for TropicsSpigot JAR
-    let bind_addr = "127.0.0.1:8080";
+    let bind_addr = "192.168.1.13:1438";
     let upstream_url = "https://repo1.maven.org/maven2"; // Fallback for other files
     let metadata_url = "https://spout.liftgate.io/metadata/tropicspigot/currentBuildVersion/".to_string();
     let download_url = "https://spout.liftgate.io/delivery/tropicspigot/tropicspigot.jar".to_string();
