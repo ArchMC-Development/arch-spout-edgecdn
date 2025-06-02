@@ -8,5 +8,6 @@ tokio = { version = "1.45.1", features = ["rt", "rt-multi-thread", "macros"] }
 bytes = "1.10.1"
 sha2 = "0.11.0-rc.0"
 hex = "0.4.3"
-reqwest = "0.12.18"
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 chrono = "0.4.41"
+openssl = { version = "0.10", features = ["vendored"] }
