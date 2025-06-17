@@ -15,11 +15,11 @@ struct CacheEntry {
     data: Bytes,
     etag: String,
     last_modified: String,
-    expires: Instant,
+    expires: Option<Instant>, // Changed to Option to handle "never expires"
     content_type: String,
     size: usize,
     version: Option<u32>,
-    is_local_fallback: bool, // New field to track if this is from local file
+    is_local_fallback: bool,
 }
 
 // Cache statistics
@@ -30,7 +30,7 @@ struct CacheStats {
     bytes_served: u64,
     requests: u64,
     fallback_serves: u64,
-    local_fallback_serves: u64, // New field for local file serves
+    local_fallback_serves: u64,
 }
 
 // Main CDN cache structure
@@ -42,7 +42,7 @@ struct JarCdn {
     upstream_url: String,
     metadata_url: String,
     download_url: String,
-    local_jar_path: String, // Path to local fallback jar
+    local_jar_path: String,
 }
 
 impl JarCdn {
@@ -72,17 +72,16 @@ impl JarCdn {
 
         let data = fs::read(&self.local_jar_path).await?;
         let etag = Self::generate_etag(&data);
-        let now = Instant::now();
         let size = data.len();
 
         let entry = CacheEntry {
             data: Bytes::from(data),
             etag,
             last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-            expires: now + Duration::from_secs(u64::MAX), // Never expires for local fallback
+            expires: None, // None means never expires
             content_type: "application/java-archive".to_string(),
             size,
-            version: None, // We don't know the version of the local file
+            version: None,
             is_local_fallback: true,
         };
 
@@ -96,7 +95,7 @@ impl JarCdn {
     // Check current version from metadata endpoint (non-blocking)
     async fn get_current_version(&self) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10)) // Shorter timeout for background checks
+            .timeout(Duration::from_secs(10))
             .build()?;
 
         let response = client.get(&self.metadata_url).send().await?;
@@ -146,7 +145,7 @@ impl JarCdn {
                             data: data.clone(),
                             etag,
                             last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-                            expires: now + self.ttl,
+                            expires: Some(now + self.ttl), // Regular cache entries have expiration
                             content_type: "application/java-archive".to_string(),
                             size: data.len(),
                             version: Some(current_version),
@@ -170,7 +169,10 @@ impl JarCdn {
 
     // Check if cache entry is still valid
     fn is_valid(&self, entry: &CacheEntry) -> bool {
-        entry.is_local_fallback || Instant::now() < entry.expires
+        entry.is_local_fallback || match entry.expires {
+            Some(expires) => Instant::now() < expires,
+            None => true, // None means never expires (local fallback)
+        }
     }
 
     // Fetch from upstream origin silently (for background updates)
@@ -182,7 +184,7 @@ impl JarCdn {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120)) // Shorter timeout for background
+            .timeout(Duration::from_secs(120))
             .build()?;
 
         let response = client.get(&url).send().await?;
@@ -210,14 +212,13 @@ impl JarCdn {
         println!("⚡ Fast fetch from upstream: {}", url);
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5)) // Very short timeout - fail fast
+            .timeout(Duration::from_secs(5))
             .build()?;
 
         let response = client.get(&url).send().await?;
 
-        // Immediately check for 522 or any error
         if response.status().as_u16() == 522 {
-            return Err("522".into()); // Special error code for 522
+            return Err("522".into());
         }
 
         if !response.status().is_success() {
@@ -259,10 +260,10 @@ impl JarCdn {
                         data: data.clone(),
                         etag,
                         last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-                        expires: now + self.ttl,
+                        expires: Some(now + self.ttl), // Regular cache entries have expiration
                         content_type: "application/java-archive".to_string(),
                         size: data.len(),
-                        version: None, // We'll get this in background check
+                        version: None,
                         is_local_fallback: false,
                     };
 
@@ -339,7 +340,7 @@ impl JarCdn {
     async fn start_background_tasks(self: Arc<Self>) {
         let cdn = Arc::clone(&self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300)); // Check every 5 minutes
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
 
             loop {
                 interval.tick().await;
@@ -624,7 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let upstream_url = "https://repo1.maven.org/maven2";
     let metadata_url = "https://spout.liftgate.io/metadata/tropicspigot/currentBuildVersion/".to_string();
     let download_url = "https://spout.liftgate.io/delivery/tropicspigot/tropicspigot.jar".to_string();
-    let local_jar_path = "./tropicspigot.jar".to_string(); // Local file path
+    let local_jar_path = "./tropicspigot.jar".to_string();
     let max_cache_size = 50;
     let ttl_seconds = 7200;
 
