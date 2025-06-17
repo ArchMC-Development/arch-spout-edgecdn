@@ -1,13 +1,12 @@
-use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::fs;
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
-use bytes::Bytes;
-use sha2::{Sha256, Digest};
-use std::path::Path;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 
 // Cache entry with metadata
 #[derive(Clone)]
@@ -563,12 +562,10 @@ async fn handle_connection(
 
             match cdn.get(&path).await {
                 Ok(entry) => {
-                    let fetch_duration = start_time.elapsed();
-
                     // Handle conditional request
                     if let Some(client_etag) = if_none_match {
                         if client_etag == &entry.etag {
-                            println!("[CDN] 304 Not Modified for {} ({}ms)", path, fetch_duration.as_millis());
+                            println!("[CDN] 304 Not Modified for {} ({}ms)", path, start_time.elapsed().as_millis());
                             let response = HttpResponse::new(304)
                                 .header("ETag", &entry.etag)
                                 .header("Cache-Control", "public, max-age=3600")
@@ -580,7 +577,7 @@ async fn handle_connection(
                     }
 
                     println!("[CDN] Delivering {} bytes to {} ({}ms)",
-                             entry.size, client_addr, fetch_duration.as_millis());
+                             entry.size, client_addr, start_time.elapsed().as_millis());
 
                     let cache_status = if entry.is_local_fallback { "LOCAL-FALLBACK" } else { "HIT" };
 
