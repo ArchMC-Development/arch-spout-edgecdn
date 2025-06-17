@@ -73,6 +73,7 @@ impl JarCdn {
         let data = fs::read(&self.local_jar_path).await?;
         let etag = Self::generate_etag(&data);
         let now = Instant::now();
+        let size = data.len();
 
         let entry = CacheEntry {
             data: Bytes::from(data),
@@ -80,7 +81,7 @@ impl JarCdn {
             last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
             expires: now + Duration::from_secs(u64::MAX), // Never expires for local fallback
             content_type: "application/java-archive".to_string(),
-            size: data.len(),
+            size,
             version: None, // We don't know the version of the local file
             is_local_fallback: true,
         };
@@ -617,7 +618,7 @@ async fn handle_connection(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Configuration
     let bind_addr = "172.16.1.12:1438";
     let upstream_url = "https://repo1.maven.org/maven2";

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.45.1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.45.1", features = ["rt", "fs", "rt-multi-thread", "macros"] }
 bytes = "1.10.1"
 sha2 = "0.11.0-rc.0"
 hex = "0.4.3"
