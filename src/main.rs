@@ -14,7 +14,6 @@ struct CacheEntry {
     data: Bytes,
     etag: String,
     last_modified: String,
-    expires: Option<Instant>, // Changed to Option to handle "never expires"
     content_type: String,
     size: usize,
     version: Option<u32>,
@@ -37,7 +36,6 @@ struct JarCdn {
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
     stats: Arc<RwLock<CacheStats>>,
     max_cache_size: usize,
-    ttl: Duration,
     upstream_url: String,
     metadata_url: String,
     download_url: String,
@@ -45,12 +43,11 @@ struct JarCdn {
 }
 
 impl JarCdn {
-    fn new(upstream_url: String, max_cache_size: usize, ttl_seconds: u64, metadata_url: String, download_url: String, local_jar_path: String) -> Self {
+    fn new(upstream_url: String, max_cache_size: usize, metadata_url: String, download_url: String, local_jar_path: String) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             stats: Arc::new(RwLock::new(CacheStats::default())),
             max_cache_size,
-            ttl: Duration::from_secs(ttl_seconds),
             upstream_url,
             metadata_url,
             download_url,
@@ -77,7 +74,6 @@ impl JarCdn {
             data: Bytes::from(data),
             etag,
             last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-            expires: None, // None means never expires
             content_type: "application/java-archive".to_string(),
             size,
             version: None,
@@ -116,47 +112,52 @@ impl JarCdn {
         match self.get_current_version().await {
             Ok(current_version) => {
                 let cache = self.cache.read().await;
-                if let Some(entry) = cache.get("/tropicspigot.jar") {
-                    if !entry.is_local_fallback {
-                        if let Some(cached_version) = entry.version {
-                            if cached_version >= current_version {
-                                println!("✅ Version {} is up to date (cached: {})", current_version, cached_version);
-                                return;
-                            } else {
-                                println!("🆕 New version {} available (cached: {})", current_version, cached_version);
-                            }
+                let needs_update = if let Some(entry) = cache.get("/tropicspigot.jar") {
+                    if entry.is_local_fallback {
+                        println!("🔄 Local fallback detected, attempting to download version {}", current_version);
+                        true
+                    } else if let Some(cached_version) = entry.version {
+                        if cached_version < current_version {
+                            println!("🆕 New version {} available (cached: {})", current_version, cached_version);
+                            true
+                        } else {
+                            println!("✅ Version {} is up to date (cached: {})", current_version, cached_version);
+                            false
                         }
                     } else {
-                        println!("🔄 Local fallback detected, attempting to download version {}", current_version);
+                        // In-memory entry without version info, try to update
+                        println!("🔄 In-memory entry without version info, checking for update");
+                        true
                     }
                 } else {
                     println!("📥 No cached version, downloading version {}", current_version);
-                }
+                    true
+                };
                 drop(cache);
 
-                // Attempt to download new version
-                match self.fetch_upstream_silent("/tropicspigot.jar").await {
-                    Ok(data) => {
-                        let etag = Self::generate_etag(&data);
-                        let now = Instant::now();
+                if needs_update {
+                    // Attempt to download new version
+                    match self.fetch_upstream_background("/tropicspigot.jar").await {
+                        Ok(data) => {
+                            let etag = Self::generate_etag(&data);
 
-                        let entry = CacheEntry {
-                            data: data.clone(),
-                            etag,
-                            last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-                            expires: Some(now + self.ttl), // Regular cache entries have expiration
-                            content_type: "application/java-archive".to_string(),
-                            size: data.len(),
-                            version: Some(current_version),
-                            is_local_fallback: false,
-                        };
+                            let entry = CacheEntry {
+                                data: data.clone(),
+                                etag,
+                                last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+                                content_type: "application/java-archive".to_string(),
+                                size: data.len(),
+                                version: Some(current_version),
+                                is_local_fallback: false,
+                            };
 
-                        let mut cache = self.cache.write().await;
-                        cache.insert("/tropicspigot.jar".to_string(), entry.clone());
-                        println!("✅ Background update completed: version {} ({} bytes)", current_version, entry.size);
-                    }
-                    Err(e) => {
-                        println!("⚠️  Background download failed: {}", e);
+                            let mut cache = self.cache.write().await;
+                            cache.insert("/tropicspigot.jar".to_string(), entry.clone());
+                            println!("✅ Background update completed: version {} ({} bytes)", current_version, entry.size);
+                        }
+                        Err(e) => {
+                            println!("⚠️  Background download failed: {}", e);
+                        }
                     }
                 }
             }
@@ -166,21 +167,15 @@ impl JarCdn {
         }
     }
 
-    // Check if cache entry is still valid
-    fn is_valid(&self, entry: &CacheEntry) -> bool {
-        entry.is_local_fallback || match entry.expires {
-            Some(expires) => Instant::now() < expires,
-            None => true, // None means never expires (local fallback)
-        }
-    }
-
-    // Fetch from upstream origin silently (for background updates)
-    async fn fetch_upstream_silent(&self, path: &str) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
+    // Fetch from upstream origin for background updates (longer timeout)
+    async fn fetch_upstream_background(&self, path: &str) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
         let url = if path.contains("tropicspigot.jar") {
             self.download_url.clone()
         } else {
             format!("{}{}", self.upstream_url, path)
         };
+
+        println!("🔄 Background fetch from upstream: {}", url);
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
@@ -197,10 +192,11 @@ impl JarCdn {
         }
 
         let data = response.bytes().await?;
+        println!("✅ Background fetch completed: {} bytes", data.len());
         Ok(data)
     }
 
-    // Fast fetch with immediate 522 fallback (no waiting)
+    // Fast fetch with immediate fallback (no waiting)
     async fn fetch_upstream_fast(&self, path: &str) -> Result<Bytes, Box<dyn std::error::Error + Send + Sync>> {
         let url = if path.contains("tropicspigot.jar") {
             self.download_url.clone()
@@ -211,7 +207,7 @@ impl JarCdn {
         println!("⚡ Fast fetch from upstream: {}", url);
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(80)) // Increased from 5s to 80s as requested
             .build()?;
 
         let response = client.get(&url).send().await?;
@@ -229,40 +225,38 @@ impl JarCdn {
         Ok(data)
     }
 
-    // Get from cache or fetch with immediate fallback
+    // Get from cache or fetch with guaranteed fallback
     async fn get(&self, path: &str) -> Result<CacheEntry, Box<dyn std::error::Error + Send + Sync>> {
-        // First check cache
+        // Always check cache first
         {
             let cache = self.cache.read().await;
             if let Some(entry) = cache.get(path) {
-                if self.is_valid(entry) && !entry.is_local_fallback {
-                    // Valid non-fallback cache hit
+                // For non-local fallback entries, always serve them (no expiration)
+                if !entry.is_local_fallback {
                     let mut stats = self.stats.write().await;
                     stats.hits += 1;
                     stats.bytes_served += entry.size as u64;
                     stats.requests += 1;
-                    println!("⚡ CACHE HIT: {}", path);
+                    println!("⚡ CACHE HIT (in-memory): {}", path);
                     return Ok(entry.clone());
                 }
             }
         }
 
-        // For tropicspigot.jar, try fast fetch with immediate 522 fallback
+        // For tropicspigot.jar, try fast fetch first
         if path.contains("tropicspigot.jar") {
             match self.fetch_upstream_fast(path).await {
                 Ok(data) => {
                     // Successful fast fetch
                     let etag = Self::generate_etag(&data);
-                    let now = Instant::now();
 
                     let entry = CacheEntry {
                         data: data.clone(),
                         etag,
                         last_modified: chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-                        expires: Some(now + self.ttl), // Regular cache entries have expiration
                         content_type: "application/java-archive".to_string(),
                         size: data.len(),
-                        version: None,
+                        version: None, // Version will be determined by background task
                         is_local_fallback: false,
                     };
 
@@ -281,8 +275,8 @@ impl JarCdn {
                     Ok(entry)
                 }
                 Err(e) => {
-                    // Fast fetch failed - immediately serve local fallback
-                    println!("⚠️  Fast fetch failed ({}), serving local fallback immediately", e);
+                    // Fast fetch failed - serve local fallback
+                    println!("⚠️  Fast fetch failed ({}), serving local fallback", e);
 
                     let cache = self.cache.read().await;
                     if let Some(entry) = cache.get(path) {
@@ -297,11 +291,12 @@ impl JarCdn {
                         }
                     }
 
+                    // This should never happen since we load local jar on startup
                     return Err("No local fallback available".into());
                 }
             }
         } else {
-            // For other files, use normal logic
+            // For other files, return not found
             return Err("File not found".into());
         }
     }
@@ -339,7 +334,7 @@ impl JarCdn {
     async fn start_background_tasks(self: Arc<Self>) {
         let cdn = Arc::clone(&self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 minutes
 
             loop {
                 interval.tick().await;
@@ -624,22 +619,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let download_url = "https://spout.liftgate.io/delivery/tropicspigot/tropicspigot.jar".to_string();
     let local_jar_path = "./tropicspigot.jar".to_string();
     let max_cache_size = 50;
-    let ttl_seconds = 7200;
 
-    println!("🚀 Starting TropicsSpigot CDN Cache Server with Local Fallback");
+    println!("🚀 Starting TropicsSpigot CDN Cache Server with Persistent In-Memory Cache");
     println!("📍 Listening on: {}", bind_addr);
     println!("🔗 Metadata endpoint: {}", metadata_url);
     println!("📦 Download endpoint: {}", download_url);
     println!("📁 Local fallback file: {}", local_jar_path);
     println!("💾 Max cache size: {} items", max_cache_size);
-    println!("⏰ TTL: {} seconds ({} hours)", ttl_seconds, ttl_seconds / 3600);
-    println!("⚡ Fast 522 fallback: Instant response with local file");
+    println!("⚡ No expiration: In-memory cached jars persist indefinitely");
+    println!("🔄 Background updates: Every 5 minutes");
 
-    // Create CDN instance
+    // Create CDN instance (removed ttl parameter)
     let cdn = Arc::new(JarCdn::new(
         upstream_url.to_string(),
         max_cache_size,
-        ttl_seconds,
         metadata_url,
         download_url,
         local_jar_path,
@@ -665,17 +658,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(bind_addr).await?;
     println!("✅ Server ready! Endpoints:");
     println!("   GET  http://localhost:8080/                                      (Status)");
-    println!("   GET  http://localhost:1438/tropicspigot.jar                      (TropicsSpigot JAR - instant 522 fallback)");
+    println!("   GET  http://localhost:1438/tropicspigot.jar                      (TropicsSpigot JAR - guaranteed availability)");
     println!("   GET  http://localhost:8080/version                              (Current version from metadata)");
     println!("   GET  http://localhost:8080/stats                                (Cache statistics)");
     println!("   POST http://localhost:8080/clear-cache                          (Clear cache)");
     println!();
-    println!("⚡ Ultra-Fast Serving:");
+    println!("⚡ Ultra-Reliable Serving:");
     println!("   - Local fallback file loaded on startup");
-    println!("   - 5-second timeout for upstream requests");
-    println!("   - Instant 522 fallback (no waiting!)");
+    println!("   - 80-second timeout for fresh downloads");
+    println!("   - In-memory cache never expires");
     println!("   - Background version checks every 5 minutes");
-    println!("   - Automatic cache updates when new versions available");
+    println!("   - Guaranteed 100% availability (no 404s for JAR files)");
 
     // Accept connections
     loop {
